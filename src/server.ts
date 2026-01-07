@@ -13,9 +13,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import path from 'path';
 import { AgentOrchestrator } from './agents/orchestrator.js';
-import { CONFIG, requireApiKey } from './config.js';
+import { CONFIG } from './config.js';
 import { LocalHybridMemoryStore } from './memory/localMemoryStore.js';
-import { OpenAIProvider } from './llm/provider.js';
+import { McpSamplingProvider } from './llm/provider.js';
 import { AgentRole } from './types.js';
 
 /**
@@ -36,27 +36,8 @@ function formatResult(payload: unknown) {
  * Main entry point for the MCP server.
  */
 async function main(): Promise<void> {
-  requireApiKey();
-
-  // Initialize memory store and LLM provider
+  // Initialize memory store
   const memory = new LocalHybridMemoryStore(path.join(CONFIG.dataDir, 'sessions'));
-  const provider = new OpenAIProvider({
-    apiKey: CONFIG.apiKey,
-    baseUrl: CONFIG.baseUrl,
-    model: CONFIG.model,
-    temperature: CONFIG.temperature,
-  });
-
-  // Initialize orchestrator with defaults
-  const orchestrator = new AgentOrchestrator({
-    provider,
-    memory,
-    defaults: {
-      model: CONFIG.model,
-      temperature: CONFIG.temperature,
-      maxDepth: CONFIG.defaultMaxDepth,
-    },
-  });
 
   // Create MCP server
   const server = new McpServer(
@@ -72,6 +53,23 @@ async function main(): Promise<void> {
         'Planner plus recursive code/analysis subagents. Provide a session_id to preserve scratchpad between calls.',
     },
   );
+
+  // Initialize LLM provider using MCP sampling
+  const provider = new McpSamplingProvider(server, {
+    model: CONFIG.model,
+    temperature: CONFIG.temperature,
+  });
+
+  // Initialize orchestrator with defaults
+  const orchestrator = new AgentOrchestrator({
+    provider,
+    memory,
+    defaults: {
+      model: CONFIG.model,
+      temperature: CONFIG.temperature,
+      maxDepth: CONFIG.defaultMaxDepth,
+    },
+  });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Tool: planner

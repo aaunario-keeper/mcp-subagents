@@ -1,15 +1,11 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ChatMessage } from '../types.js';
-
-/** Default timeout for LLM API requests in milliseconds */
-const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface CompletionOptions {
   model?: string;
   temperature?: number;
   responseFormat?: 'text' | 'json';
   maxTokens?: number;
-  /** Request timeout in milliseconds (default: 60000) */
-  timeoutMs?: number;
 }
 
 /**
@@ -19,87 +15,52 @@ export interface LLMProvider {
   complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string>;
 }
 
-/** Response structure from OpenAI-compatible APIs */
-interface OpenAIResponse {
-  choices: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
-}
-
 /**
- * OpenAI-compatible LLM provider.
- * Supports any API that implements the OpenAI chat completions interface.
+ * LLM provider that uses MCP's sampling capability.
+ * Delegates completion requests to the MCP client.
  */
-export class OpenAIProvider implements LLMProvider {
-  private apiKey: string;
-  private baseUrl: string;
+export class McpSamplingProvider implements LLMProvider {
+  private server: McpServer;
   private defaultModel: string;
   private defaultTemperature: number;
 
-  constructor(opts: { apiKey: string; baseUrl: string; model: string; temperature?: number }) {
-    this.apiKey = opts.apiKey;
-    this.baseUrl = opts.baseUrl.replace(/\/$/, '');
+  constructor(server: McpServer, opts: { model: string; temperature?: number }) {
+    this.server = server;
     this.defaultModel = opts.model;
     this.defaultTemperature = opts.temperature ?? 0.2;
   }
 
   /**
-   * Send a chat completion request to the LLM.
+   * Send a completion request via MCP sampling.
    *
    * @param messages - Array of chat messages (system, user, assistant)
    * @param options - Optional completion parameters
    * @returns The assistant's response content
-   * @throws Error if the request times out, fails, or returns no content
+   * @throws Error if sampling fails or returns no content
    */
   async complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string> {
-    const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    // Convert messages to MCP sampling format
+    const systemPrompt = messages.find((m) => m.role === 'system')?.content;
+    const samplingMessages = messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({
+        role: m.role as 'user' | 'assistant',
+        content: { type: 'text' as const, text: m.content },
+      }));
 
-    const body = {
-      model: options?.model ?? this.defaultModel,
-      temperature: options?.temperature ?? this.defaultTemperature,
-      messages: messages.map((msg) => ({ role: msg.role, content: msg.content })),
-      response_format: options?.responseFormat === 'json' ? { type: 'json_object' as const } : undefined,
-      max_tokens: options?.maxTokens,
-    };
+    const result = await this.server.server.createMessage({
+      messages: samplingMessages,
+      systemPrompt,
+      modelPreferences: {
+        hints: [{ name: options?.model ?? this.defaultModel }],
+      },
+      maxTokens: options?.maxTokens ?? 4096,
+    });
 
-    try {
-      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(`LLM request failed (${response.status}): ${detail}`);
-      }
-
-      const data = (await response.json()) as OpenAIResponse;
-
-      const content = data.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error('LLM response missing content.');
-      }
-
-      return content;
-    } catch (error) {
-      clearTimeout(timeoutId);
-
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`LLM request timed out after ${timeoutMs}ms`);
-      }
-
-      throw error;
+    if (result.content.type !== 'text') {
+      throw new Error('MCP sampling returned non-text content');
     }
+
+    return result.content.text;
   }
 }
