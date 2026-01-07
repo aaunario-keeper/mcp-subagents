@@ -1,14 +1,17 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ChatMessage } from '../types.js';
 
+/** JSON format instruction to append to system prompts */
+const JSON_FORMAT_INSTRUCTION =
+  'IMPORTANT: You must respond with valid JSON only. No markdown, no code fences, just raw JSON.';
+
 export interface CompletionOptions {
   model?: string;
   temperature?: number;
   /**
    * Preferred response format hint.
    * Note: MCP sampling doesn't support response_format natively.
-   * JSON formatting must be requested via the system prompt instead.
-   * This field is retained for API compatibility but currently ignored.
+   * JSON formatting is requested by appending instructions to the system prompt.
    */
   responseFormat?: 'text' | 'json';
   maxTokens?: number;
@@ -26,7 +29,7 @@ export interface LLMProvider {
  * Uses the MCP sampling/createMessage capability.
  *
  * Note: MCP sampling doesn't support response_format. To get JSON output,
- * include explicit JSON formatting instructions in your system prompt.
+ * this provider appends JSON formatting instructions to the system prompt.
  */
 export class McpSamplingProvider implements LLMProvider {
   private server: McpServer;
@@ -43,10 +46,15 @@ export class McpSamplingProvider implements LLMProvider {
     // Extract system prompt (MCP sampling uses systemPrompt field, not a system message)
     let systemPrompt = messages.find((m) => m.role === 'system')?.content;
 
-    // If JSON format is requested, append instruction to system prompt
+    // If JSON format is requested, ensure instruction is in system prompt
     // (MCP sampling doesn't support response_format natively)
-    if (options?.responseFormat === 'json' && systemPrompt) {
-      systemPrompt = `${systemPrompt}\n\nIMPORTANT: You must respond with valid JSON only. No markdown, no code fences, just raw JSON.`;
+    if (options?.responseFormat === 'json') {
+      if (systemPrompt) {
+        systemPrompt = `${systemPrompt}\n\n${JSON_FORMAT_INSTRUCTION}`;
+      } else {
+        // No existing system prompt - create one with just the JSON instruction
+        systemPrompt = JSON_FORMAT_INSTRUCTION;
+      }
     }
 
     // Convert non-system messages to MCP format (only user/assistant allowed)

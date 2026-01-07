@@ -11,31 +11,47 @@ function sanitizeSessionId(sessionId: string): string {
 
 /**
  * Simple async mutex for preventing concurrent access to the same resource.
+ * Uses a queue-based approach to ensure FIFO ordering and true mutual exclusion.
  */
 class AsyncMutex {
-  private locks = new Map<string, Promise<void>>();
+  private queues = new Map<string, Array<() => void>>();
+  private held = new Set<string>();
 
   /**
    * Execute a function with exclusive access to the given key.
+   * Callers are queued and executed in FIFO order.
    */
   async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    // Wait for any existing lock on this key
-    while (this.locks.has(key)) {
-      await this.locks.get(key);
+    // If lock is held, wait in queue
+    if (this.held.has(key)) {
+      await new Promise<void>((resolve) => {
+        let queue = this.queues.get(key);
+        if (!queue) {
+          queue = [];
+          this.queues.set(key, queue);
+        }
+        queue.push(resolve);
+      });
     }
 
-    // Create our lock
-    let resolve: () => void;
-    const promise = new Promise<void>((r) => {
-      resolve = r;
-    });
-    this.locks.set(key, promise);
+    // Acquire lock
+    this.held.add(key);
 
     try {
       return await fn();
     } finally {
-      this.locks.delete(key);
-      resolve!();
+      // Release lock and wake next waiter
+      this.held.delete(key);
+      const queue = this.queues.get(key);
+      if (queue && queue.length > 0) {
+        const next = queue.shift()!;
+        if (queue.length === 0) {
+          this.queues.delete(key);
+        }
+        // Mark as held before waking to prevent race
+        this.held.add(key);
+        next();
+      }
     }
   }
 }
