@@ -2,11 +2,11 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Load env silently to avoid interfering with MCP stdio JSON-RPC handshake
-dotenv.config({ quiet: true });
-
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
+
+// Load env silently from project root to avoid cwd surprises.
+dotenv.config({ quiet: true, path: path.join(projectRoot, '.env'), override: true });
 
 /**
  * Parse a positive integer from an environment variable.

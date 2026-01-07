@@ -15,7 +15,7 @@ import path from 'path';
 import { AgentOrchestrator } from './agents/orchestrator.js';
 import { CONFIG } from './config.js';
 import { LocalHybridMemoryStore } from './memory/localMemoryStore.js';
-import { McpSamplingProvider } from './llm/provider.js';
+import { createDefaultProvider } from './llm/provider.js';
 import { AgentRole } from './types.js';
 
 /**
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
   );
 
   // Initialize LLM provider using MCP sampling
-  const provider = new McpSamplingProvider(server, {
+  const provider = createDefaultProvider(server, {
     model: CONFIG.model,
     temperature: CONFIG.temperature,
   });
@@ -80,6 +80,11 @@ async function main(): Promise<void> {
     context: z.string().optional().describe('Additional context for the planner'),
     session_id: z.string().optional().describe('Session ID for scratchpad persistence'),
     max_depth: z.number().int().min(1).max(8).optional().describe('Maximum delegation depth (1-8)'),
+    openai_api_key: z
+      .string()
+      .min(1)
+      .optional()
+      .describe('Optional OpenAI API key for fallback when sampling is unavailable'),
   });
 
   server.registerTool(
@@ -89,11 +94,12 @@ async function main(): Promise<void> {
       description: 'Decompose a task, delegate to subagents, and return a concise plan with results.',
       inputSchema: plannerSchema,
     },
-    async ({ task, context, session_id, max_depth }) => {
+    async ({ task, context, session_id, max_depth, openai_api_key }) => {
       const result = await orchestrator.run({
         role: 'planner',
         objective: task,
         context,
+        apiKey: openai_api_key,
         sessionId: session_id,
         maxDepth: max_depth,
       });
@@ -113,6 +119,11 @@ async function main(): Promise<void> {
     context: z.string().optional().describe('Additional context'),
     session_id: z.string().optional().describe('Session ID for scratchpad persistence'),
     max_depth: z.number().int().min(1).max(8).optional().describe('Maximum delegation depth (1-8)'),
+    openai_api_key: z
+      .string()
+      .min(1)
+      .optional()
+      .describe('Optional OpenAI API key for fallback when sampling is unavailable'),
   });
 
   server.registerTool(
@@ -122,11 +133,12 @@ async function main(): Promise<void> {
       description: 'Run a specific agent role with optional recursive delegation.',
       inputSchema: subagentSchema,
     },
-    async ({ role, objective, context, session_id, max_depth }) => {
+    async ({ role, objective, context, session_id, max_depth, openai_api_key }) => {
       const result = await orchestrator.run({
         role: role as AgentRole,
         objective,
         context,
+        apiKey: openai_api_key,
         sessionId: session_id,
         maxDepth: max_depth,
       });
@@ -169,6 +181,30 @@ async function main(): Promise<void> {
     async ({ session_id }) => {
       await memory.clear(session_id ?? 'default');
       return formatResult({ cleared: session_id ?? 'default' });
+    },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Tool: env_status
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const envStatusSchema = z.object({});
+
+  server.registerTool(
+    'env_status',
+    {
+      title: 'Env status',
+      description:
+        'Report whether expected environment variables are present (no secrets).',
+      inputSchema: envStatusSchema,
+    },
+    async () => {
+      return formatResult({
+        envPath: path.join(CONFIG.projectRoot, '.env'),
+        hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY?.trim()),
+        hasExtraCa: Boolean(process.env.NODE_EXTRA_CA_CERTS?.trim()),
+        extraCaPath: process.env.NODE_EXTRA_CA_CERTS ?? null,
+      });
     },
   );
 

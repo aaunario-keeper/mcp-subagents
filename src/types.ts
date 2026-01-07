@@ -11,6 +11,8 @@ export interface AgentRequest {
   objective: string;
   /** Optional additional context to inform the agent */
   context?: string;
+  /** Optional OpenAI API key override for this request (not persisted) */
+  apiKey?: string;
   /** Session ID for scratchpad persistence (defaults to 'default') */
   sessionId?: string;
   /** Current recursion depth (internal use) */

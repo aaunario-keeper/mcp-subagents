@@ -13,6 +13,11 @@ MCP stdio server that exposes a planner tool plus recursive code/analysis subage
 - Node 18.18+.
 - MCP client capable of `createMessage` (Codex CLI covers this).
 
+Optional fallback (when the client does not support sampling):
+- `OPENAI_API_KEY` for direct OpenAI chat completions.
+- `OPENAI_BASE_URL` to override the API base URL (defaults to `https://api.openai.com/v1`).
+- You can also pass `openai_api_key` in tool arguments to provide a key per request.
+
 ## Quickstart
 ```powershell
 cd my-repos/mcp-subagents
