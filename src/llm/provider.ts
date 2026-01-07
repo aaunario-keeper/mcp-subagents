@@ -4,6 +4,12 @@ import { ChatMessage } from '../types.js';
 export interface CompletionOptions {
   model?: string;
   temperature?: number;
+  /**
+   * Preferred response format hint.
+   * Note: MCP sampling doesn't support response_format natively.
+   * JSON formatting must be requested via the system prompt instead.
+   * This field is retained for API compatibility but currently ignored.
+   */
   responseFormat?: 'text' | 'json';
   maxTokens?: number;
 }
@@ -18,6 +24,9 @@ export interface LLMProvider {
 /**
  * LLM provider that delegates sampling to the MCP client (no API key needed).
  * Uses the MCP sampling/createMessage capability.
+ *
+ * Note: MCP sampling doesn't support response_format. To get JSON output,
+ * include explicit JSON formatting instructions in your system prompt.
  */
 export class McpSamplingProvider implements LLMProvider {
   private server: McpServer;
@@ -32,7 +41,13 @@ export class McpSamplingProvider implements LLMProvider {
 
   async complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string> {
     // Extract system prompt (MCP sampling uses systemPrompt field, not a system message)
-    const systemPrompt = messages.find((m) => m.role === 'system')?.content;
+    let systemPrompt = messages.find((m) => m.role === 'system')?.content;
+
+    // If JSON format is requested, append instruction to system prompt
+    // (MCP sampling doesn't support response_format natively)
+    if (options?.responseFormat === 'json' && systemPrompt) {
+      systemPrompt = `${systemPrompt}\n\nIMPORTANT: You must respond with valid JSON only. No markdown, no code fences, just raw JSON.`;
+    }
 
     // Convert non-system messages to MCP format (only user/assistant allowed)
     const mcpMessages = messages

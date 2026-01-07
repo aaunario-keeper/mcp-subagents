@@ -34,7 +34,7 @@ export interface OrchestratorOptions {
   /** LLM caller for completions (client-provided) */
   llm: (
     messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
-    options?: { model?: string; temperature?: number },
+    options?: { model?: string; temperature?: number; responseFormat?: 'text' | 'json' },
   ) => Promise<string>;
   /** Memory store for session persistence */
   memory: LocalHybridMemoryStore;
@@ -58,7 +58,7 @@ export interface OrchestratorOptions {
 export class AgentOrchestrator {
   private llm: (
     messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
-    options?: { model?: string; temperature?: number },
+    options?: { model?: string; temperature?: number; responseFormat?: 'text' | 'json' },
   ) => Promise<string>;
   private memory: LocalHybridMemoryStore;
   private defaults: { model: string; temperature: number; maxDepth: number };
@@ -115,10 +115,11 @@ export class AgentOrchestrator {
       },
     ];
 
-    // Get LLM completion and parse response
+    // Get LLM completion and parse response (request JSON format for structured output)
     const raw = await this.llm(messages, {
       model: this.defaults.model,
       temperature: this.defaults.temperature,
+      responseFormat: 'json',
     });
     const parsed = parseAgentResponse(raw);
     const delegations = this.prepareDelegations(parsed.delegations ?? [], depth, maxDepth);

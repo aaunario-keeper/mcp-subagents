@@ -62,13 +62,10 @@ export class LocalHybridMemoryStore {
   }
 
   /**
-   * Read all log entries for a session.
-   * Returns an empty array if the session doesn't exist or the file is corrupted.
-   *
-   * @param sessionId - Session identifier
-   * @returns Array of session log entries
+   * Internal read implementation (not protected by mutex).
+   * Use read() for external calls.
    */
-  async read(sessionId: string): Promise<SessionLogEntry[]> {
+  private async readInternal(sessionId: string): Promise<SessionLogEntry[]> {
     const filePath = this.sessionPath(sessionId);
     try {
       const content = await fs.readFile(filePath, 'utf8');
@@ -106,6 +103,18 @@ export class LocalHybridMemoryStore {
   }
 
   /**
+   * Read all log entries for a session.
+   * Thread-safe: uses mutex to prevent reading during concurrent writes.
+   * Returns an empty array if the session doesn't exist or the file is corrupted.
+   *
+   * @param sessionId - Session identifier
+   * @returns Array of session log entries
+   */
+  async read(sessionId: string): Promise<SessionLogEntry[]> {
+    return this.mutex.withLock(sessionId, () => this.readInternal(sessionId));
+  }
+
+  /**
    * Append a log entry to a session.
    * Thread-safe: uses mutex to prevent concurrent writes from losing data.
    *
@@ -115,7 +124,7 @@ export class LocalHybridMemoryStore {
   async append(sessionId: string, entry: SessionLogEntry): Promise<void> {
     await this.mutex.withLock(sessionId, async () => {
       await this.ensureDir();
-      const existing = await this.read(sessionId);
+      const existing = await this.readInternal(sessionId);
       existing.push(entry);
       const filePath = this.sessionPath(sessionId);
       await fs.writeFile(filePath, JSON.stringify(existing, null, 2), 'utf8');
@@ -124,6 +133,7 @@ export class LocalHybridMemoryStore {
 
   /**
    * Clear all log entries for a session by deleting the file.
+   * Thread-safe: uses mutex to prevent clearing during concurrent access.
    *
    * @param sessionId - Session identifier
    */
