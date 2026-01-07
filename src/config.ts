@@ -2,7 +2,8 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-dotenv.config();
+// Load env silently to avoid interfering with MCP stdio JSON-RPC handshake
+dotenv.config({ quiet: true });
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, '..');
