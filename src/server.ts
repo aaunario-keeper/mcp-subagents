@@ -50,7 +50,7 @@ async function main(): Promise<void> {
         tools: {},
       },
       instructions:
-        'Planner plus recursive code/analysis subagents. Provide a session_id to preserve scratchpad between calls.',
+        'Planner plus recursive code/analysis subagents. Provide a session_id to preserve scratchpad between calls. Uses client-sampled LLM (no direct API key required).',
     },
   );
 
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
 
   // Initialize orchestrator with defaults
   const orchestrator = new AgentOrchestrator({
-    provider,
+    llm: (messages, options) => provider.complete(messages, options),
     memory,
     defaults: {
       model: CONFIG.model,

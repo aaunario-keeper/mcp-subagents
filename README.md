@@ -6,12 +6,12 @@ MCP stdio server that exposes a planner tool plus recursive code/analysis subage
 - Planner tool that decomposes tasks and delegates.
 - Code and analysis subagents that can delegate recursively (depth limited).
 - Session-aware scratchpad persisted to `data/sessions/*.json`.
-- OpenAI-compatible provider (override `OPENAI_BASE_URL` if needed).
+- Uses MCP client sampling (no server-side API key needed).
 - Includes a patch-package fix for GHSA-8r9q-7v3j-jr4g (UriTemplate ReDoS) in `@modelcontextprotocol/sdk@1.25.1`.
 
 ## Requirements
 - Node 18.18+.
-- `OPENAI_API_KEY` in your environment.
+- MCP client capable of `createMessage` (Codex CLI covers this).
 
 ## Quickstart
 ```powershell

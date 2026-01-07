@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { CompletionOptions, LLMProvider } from '../llm/provider.js';
 import { LocalHybridMemoryStore } from '../memory/localMemoryStore.js';
 import { AgentDelegation, AgentRequest, AgentResult, AgentRole, SessionLogEntry } from '../types.js';
 import { safeParseJson } from '../utils/json.js';
@@ -32,8 +31,11 @@ const MAX_DELEGATIONS_PER_AGENT = 4;
  * Configuration options for the AgentOrchestrator.
  */
 export interface OrchestratorOptions {
-  /** LLM provider for completions */
-  provider: LLMProvider;
+  /** LLM caller for completions (client-provided) */
+  llm: (
+    messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
+    options?: { model?: string; temperature?: number },
+  ) => Promise<string>;
   /** Memory store for session persistence */
   memory: LocalHybridMemoryStore;
   /** Default values for agent execution */
@@ -54,12 +56,15 @@ export interface OrchestratorOptions {
  * - Depth limiting to prevent infinite recursion
  */
 export class AgentOrchestrator {
-  private provider: LLMProvider;
+  private llm: (
+    messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
+    options?: { model?: string; temperature?: number },
+  ) => Promise<string>;
   private memory: LocalHybridMemoryStore;
   private defaults: { model: string; temperature: number; maxDepth: number };
 
   constructor(opts: OrchestratorOptions) {
-    this.provider = opts.provider;
+    this.llm = opts.llm;
     this.memory = opts.memory;
     this.defaults = opts.defaults;
   }
@@ -110,14 +115,11 @@ export class AgentOrchestrator {
       },
     ];
 
-    const completionOptions: CompletionOptions = {
+    // Get LLM completion and parse response
+    const raw = await this.llm(messages, {
       model: this.defaults.model,
       temperature: this.defaults.temperature,
-      responseFormat: 'json',
-    };
-
-    // Get LLM completion and parse response
-    const raw = await this.provider.complete(messages, completionOptions);
+    });
     const parsed = parseAgentResponse(raw);
     const delegations = this.prepareDelegations(parsed.delegations ?? [], depth, maxDepth);
 

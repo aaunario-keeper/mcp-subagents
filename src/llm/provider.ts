@@ -16,8 +16,8 @@ export interface LLMProvider {
 }
 
 /**
- * LLM provider that uses MCP's sampling capability.
- * Delegates completion requests to the MCP client.
+ * LLM provider that delegates sampling to the MCP client (no API key needed).
+ * Uses the MCP sampling/createMessage capability.
  */
 export class McpSamplingProvider implements LLMProvider {
   private server: McpServer;
@@ -30,37 +30,43 @@ export class McpSamplingProvider implements LLMProvider {
     this.defaultTemperature = opts.temperature ?? 0.2;
   }
 
-  /**
-   * Send a completion request via MCP sampling.
-   *
-   * @param messages - Array of chat messages (system, user, assistant)
-   * @param options - Optional completion parameters
-   * @returns The assistant's response content
-   * @throws Error if sampling fails or returns no content
-   */
   async complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string> {
-    // Convert messages to MCP sampling format
+    // Extract system prompt (MCP sampling uses systemPrompt field, not a system message)
     const systemPrompt = messages.find((m) => m.role === 'system')?.content;
-    const samplingMessages = messages
+
+    // Convert non-system messages to MCP format (only user/assistant allowed)
+    const mcpMessages = messages
       .filter((m) => m.role !== 'system')
       .map((m) => ({
         role: m.role as 'user' | 'assistant',
         content: { type: 'text' as const, text: m.content },
       }));
 
+    // Call the underlying Server's createMessage (McpServer.server is the Server instance)
     const result = await this.server.server.createMessage({
-      messages: samplingMessages,
+      messages: mcpMessages,
       systemPrompt,
       modelPreferences: {
         hints: [{ name: options?.model ?? this.defaultModel }],
       },
+      temperature: options?.temperature ?? this.defaultTemperature,
       maxTokens: options?.maxTokens ?? 4096,
     });
 
-    if (result.content.type !== 'text') {
-      throw new Error('MCP sampling returned non-text content');
+    // Extract text from result content
+    const content = result.content;
+    let text: string;
+
+    if (content.type === 'text') {
+      text = content.text;
+    } else {
+      throw new Error(`MCP sampling returned unsupported content type: ${content.type}`);
     }
 
-    return result.content.text;
+    if (!text.trim()) {
+      throw new Error('MCP client returned empty text content from createMessage.');
+    }
+
+    return text;
   }
 }
