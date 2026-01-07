@@ -1,0 +1,103 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/cjs/shared/uriTemplate.js b/node_modules/@modelcontextprotocol/sdk/dist/cjs/shared/uriTemplate.js
+index baad5d9..32410e1 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/cjs/shared/uriTemplate.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/cjs/shared/uriTemplate.js
+@@ -2,10 +2,17 @@
+ // Claude-authored implementation of RFC 6570 URI Templates
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.UriTemplate = void 0;
++const safe_regex_1 = require("safe-regex");
++const ensureSafe = (pattern) => (safe_regex_1.default ?? safe_regex_1)(pattern);
+ const MAX_TEMPLATE_LENGTH = 1000000; // 1MB
+ const MAX_VARIABLE_LENGTH = 1000000; // 1MB
+ const MAX_TEMPLATE_EXPRESSIONS = 10000;
+ const MAX_REGEX_LENGTH = 1000000; // 1MB
++function assertSafeRegex(pattern) {
++    if (!ensureSafe(pattern)) {
++        throw new Error('Generated regex pattern is unsafe (potential catastrophic backtracking)');
++    }
++}
+ class UriTemplate {
+     /**
+      * Returns true if the given string contains any URI template expressions.
+@@ -180,20 +187,20 @@ class UriTemplate {
+             }
+             return patterns;
+         }
+-        let pattern;
+-        const name = part.name;
+-        switch (part.operator) {
+-            case '':
+-                pattern = part.exploded ? '([^/]+(?:,[^/]+)*)' : '([^/,]+)';
+-                break;
+-            case '+':
+-            case '#':
+-                pattern = '(.+)';
+-                break;
+-            case '.':
+-                pattern = '\\.([^/,]+)';
+-                break;
+-            case '/':
++            let pattern;
++            const name = part.name;
++            switch (part.operator) {
++                case '':
++                    pattern = part.exploded ? '([^/]+(?:,[^/]+)*)' : '([^/,]+)';
++                    break;
++                case '+':
++                case '#':
++                    pattern = '([^?#]+)';
++                    break;
++                case '.':
++                    pattern = '\\.([^/,]+)';
++                    break;
++                case '/':
+                 pattern = '/' + (part.exploded ? '([^/]+(?:,[^/]+)*)' : '([^/,]+)');
+                 break;
+             default:
+@@ -220,6 +227,7 @@ class UriTemplate {
+         }
+         pattern += '$';
+         UriTemplate.validateLength(pattern, MAX_REGEX_LENGTH, 'Generated regex pattern');
++        assertSafeRegex(pattern);
+         const regex = new RegExp(pattern);
+         const match = uri.match(regex);
+         if (!match)
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/esm/shared/uriTemplate.js b/node_modules/@modelcontextprotocol/sdk/dist/esm/shared/uriTemplate.js
+index 2837ba8..9fd96e4 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/esm/shared/uriTemplate.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/esm/shared/uriTemplate.js
+@@ -1,8 +1,16 @@
++import safeRegex from 'safe-regex';
+ // Claude-authored implementation of RFC 6570 URI Templates
+ const MAX_TEMPLATE_LENGTH = 1000000; // 1MB
+ const MAX_VARIABLE_LENGTH = 1000000; // 1MB
+ const MAX_TEMPLATE_EXPRESSIONS = 10000;
+ const MAX_REGEX_LENGTH = 1000000; // 1MB
++
++function assertSafeRegex(pattern) {
++    if (!safeRegex(pattern)) {
++        throw new Error('Generated regex pattern is unsafe (potential catastrophic backtracking)');
++    }
++}
++
+ export class UriTemplate {
+     /**
+      * Returns true if the given string contains any URI template expressions.
+@@ -185,7 +193,7 @@ export class UriTemplate {
+                 break;
+             case '+':
+             case '#':
+-                pattern = '(.+)';
++                pattern = '([^?#]+)';
+                 break;
+             case '.':
+                 pattern = '\\.([^/,]+)';
+@@ -217,6 +225,7 @@ export class UriTemplate {
+         }
+         pattern += '$';
+         UriTemplate.validateLength(pattern, MAX_REGEX_LENGTH, 'Generated regex pattern');
++        assertSafeRegex(pattern);
+         const regex = new RegExp(pattern);
+         const match = uri.match(regex);
+         if (!match)
