@@ -12,11 +12,33 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import path from 'path';
+import { AgenticExecutor } from './agents/agenticExecutor.js';
 import { AgentOrchestrator } from './agents/orchestrator.js';
 import { CONFIG } from './config.js';
-import { LocalHybridMemoryStore } from './memory/localMemoryStore.js';
-import { createDefaultProvider } from './llm/provider.js';
-import { AgentRole } from './types.js';
+import { DirectOpenAiProvider, createDefaultProvider } from './llm/provider.js';
+import { LocalHybridMemoryStore, normalizeSessionId } from './memory/localMemoryStore.js';
+import { parseCodexConfig, extractMcpServers, parseCustomServersConfig } from './mcp/configParser.js';
+import { McpClientManager } from './mcp/clientManager.js';
+import type { McpServerConfig } from './mcp/clientManager.js';
+import { ToolFeedbackStore } from './mcp/toolFeedbackStore.js';
+import { ToolRegistry } from './mcp/toolRegistry.js';
+import { AgentRole, TOOL_ACCESS_LEVELS } from './types.js';
+
+function matchesAllowlist(name: string, patterns: string[]): boolean {
+  for (const pattern of patterns) {
+    if (pattern === name) {
+      return true;
+    }
+    if (pattern.includes('*')) {
+      const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(`^${escaped.replace(/\*/g, '.*')}$`);
+      if (regex.test(name)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Format a result payload for MCP tool response.
@@ -36,8 +58,11 @@ function formatResult(payload: unknown) {
  * Main entry point for the MCP server.
  */
 async function main(): Promise<void> {
-  // Initialize memory store
-  const memory = new LocalHybridMemoryStore(path.join(CONFIG.dataDir, 'sessions'));
+  // Initialize memory store with size cap to prevent unbounded log growth
+  const memory = new LocalHybridMemoryStore(
+    path.join(CONFIG.dataDir, 'sessions'),
+    CONFIG.maxSessionLogBytes,
+  );
 
   // Create MCP server
   const server = new McpServer(
@@ -50,7 +75,7 @@ async function main(): Promise<void> {
         tools: {},
       },
       instructions:
-        'Planner plus recursive code/analysis subagents. Provide a session_id to preserve scratchpad between calls. Uses client-sampled LLM (no direct API key required).',
+        'Planner plus recursive code/analysis/research/review/test subagents. Provide a session_id to preserve scratchpad between calls. Tool-using roles require an OpenAI API key.',
     },
   );
 
@@ -60,15 +85,86 @@ async function main(): Promise<void> {
     temperature: CONFIG.temperature,
   });
 
-  // Initialize orchestrator with defaults
+  const directProvider = new DirectOpenAiProvider({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseUrl: process.env.OPENAI_BASE_URL,
+    defaultModel: CONFIG.model,
+    defaultTemperature: CONFIG.temperature,
+  });
+
+  // Initialize MCP client manager for external tools (lazy connect)
+  const clientManager = new McpClientManager({
+    toolCallTimeoutMs: CONFIG.mcpToolTimeoutMs,
+    listToolsTimeoutMs: CONFIG.mcpListToolsTimeoutMs,
+    toolCallRetries: CONFIG.mcpToolRetries,
+    toolCallRetryDelayMs: CONFIG.mcpToolRetryDelayMs,
+  });
+  const toolRegistry = new ToolRegistry(clientManager, {
+    roleAccessLevels: CONFIG.toolAccessLevels,
+  });
+  const feedbackStore = new ToolFeedbackStore(path.join(CONFIG.dataDir, 'tool-feedback.json'));
+  const feedbackState = await feedbackStore.read();
+  let currentToolOverrides = feedbackState.overrides;
+  toolRegistry.setAccessOverrides(currentToolOverrides);
+
+  const initTooling = async () => {
+    let mcpConfigs: McpServerConfig[] = [];
+    try {
+      if (CONFIG.mcpServersConfigPath) {
+        mcpConfigs = await parseCustomServersConfig(CONFIG.mcpServersConfigPath);
+        console.error(
+          `Loaded ${mcpConfigs.length} MCP server configs from ${CONFIG.mcpServersConfigPath}`,
+        );
+      } else {
+        const codexConfig = await parseCodexConfig(CONFIG.codexConfigPath);
+        mcpConfigs = extractMcpServers(codexConfig);
+        console.error(`Loaded ${mcpConfigs.length} MCP server configs from ${CONFIG.codexConfigPath}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to load MCP server config: ${message}. Tool-using agents will be disabled.`);
+      return;
+    }
+
+    if (CONFIG.mcpServersAllowlist.length > 0) {
+      const before = mcpConfigs.length;
+      mcpConfigs = mcpConfigs.filter((config) =>
+        matchesAllowlist(config.name, CONFIG.mcpServersAllowlist),
+      );
+      console.error(`Filtered MCP servers by allowlist (${mcpConfigs.length}/${before} enabled).`);
+    }
+
+    if (mcpConfigs.length === 0) {
+      return;
+    }
+
+    console.error('Starting MCP tool discovery in background...');
+    await clientManager.connectAll(mcpConfigs);
+    await toolRegistry.refresh();
+    toolRegistry.setAccessOverrides(currentToolOverrides);
+    console.error('MCP tool discovery complete.');
+  };
+
+  const agenticExecutor = new AgenticExecutor({
+    llm: (messages, options) => directProvider.complete(messages, options),
+    toolRegistry,
+    maxIterations: CONFIG.maxAgentIterations,
+    maxToolCallsPerIteration: CONFIG.maxToolCallsPerIteration,
+    hasDefaultApiKey: directProvider.hasApiKey(),
+  });
+
+  // Initialize orchestrator with defaults and agent limits (gremlin containment)
   const orchestrator = new AgentOrchestrator({
     llm: (messages, options) => provider.complete(messages, options),
     memory,
+    toolRegistry,
+    agenticExecutor,
     defaults: {
       model: CONFIG.model,
       temperature: CONFIG.temperature,
       maxDepth: CONFIG.defaultMaxDepth,
     },
+    maxAgentsPerSession: CONFIG.maxAgentsPerSession,
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +180,7 @@ async function main(): Promise<void> {
       .string()
       .min(1)
       .optional()
-      .describe('Optional OpenAI API key for fallback when sampling is unavailable'),
+      .describe('Optional OpenAI API key for tool use or when sampling is unavailable'),
   });
 
   server.registerTool(
@@ -95,12 +191,13 @@ async function main(): Promise<void> {
       inputSchema: plannerSchema,
     },
     async ({ task, context, session_id, max_depth, openai_api_key }) => {
+      const sessionId = normalizeSessionId(session_id ?? 'default');
       const result = await orchestrator.run({
         role: 'planner',
         objective: task,
         context,
         apiKey: openai_api_key,
-        sessionId: session_id,
+        sessionId,
         maxDepth: max_depth,
       });
       return formatResult(result);
@@ -113,7 +210,14 @@ async function main(): Promise<void> {
 
   const subagentSchema = z.object({
     role: z
-      .union([z.literal('planner'), z.literal('code'), z.literal('analysis')])
+      .union([
+        z.literal('planner'),
+        z.literal('code'),
+        z.literal('analysis'),
+        z.literal('research'),
+        z.literal('review'),
+        z.literal('test'),
+      ])
       .describe('Agent role to execute'),
     objective: z.string().describe('Objective for the agent'),
     context: z.string().optional().describe('Additional context'),
@@ -123,7 +227,7 @@ async function main(): Promise<void> {
       .string()
       .min(1)
       .optional()
-      .describe('Optional OpenAI API key for fallback when sampling is unavailable'),
+      .describe('Optional OpenAI API key for tool use or when sampling is unavailable'),
   });
 
   server.registerTool(
@@ -134,12 +238,13 @@ async function main(): Promise<void> {
       inputSchema: subagentSchema,
     },
     async ({ role, objective, context, session_id, max_depth, openai_api_key }) => {
+      const sessionId = normalizeSessionId(session_id ?? 'default');
       const result = await orchestrator.run({
         role: role as AgentRole,
         objective,
         context,
         apiKey: openai_api_key,
-        sessionId: session_id,
+        sessionId,
         maxDepth: max_depth,
       });
       return formatResult(result);
@@ -162,8 +267,9 @@ async function main(): Promise<void> {
       inputSchema: sessionSchema,
     },
     async ({ session_id }) => {
-      const log = await memory.read(session_id ?? 'default');
-      return formatResult({ entries: log });
+      const sessionId = normalizeSessionId(session_id ?? 'default');
+      const log = await memory.read(sessionId);
+      return formatResult({ session_id: sessionId, entries: log });
     },
   );
 
@@ -175,12 +281,160 @@ async function main(): Promise<void> {
     'session_clear',
     {
       title: 'Session clear',
-      description: 'Clear persisted scratchpad for a session.',
+      description: 'Clear persisted scratchpad for a session and reset agent count.',
       inputSchema: sessionSchema,
     },
     async ({ session_id }) => {
-      await memory.clear(session_id ?? 'default');
-      return formatResult({ cleared: session_id ?? 'default' });
+      const sessionId = normalizeSessionId(session_id ?? 'default');
+      await memory.clear(sessionId);
+      orchestrator.resetSessionAgentCount(sessionId);
+      return formatResult({ cleared: sessionId });
+    },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Tool: tool_feedback
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const toolFeedbackSchema = z.object({
+    role: z
+      .union([
+        z.literal('planner'),
+        z.literal('code'),
+        z.literal('analysis'),
+        z.literal('research'),
+        z.literal('review'),
+        z.literal('test'),
+      ])
+      .describe('Agent role to update'),
+    tool_name: z
+      .string()
+      .optional()
+      .describe('Tool name (canonical server:tool, OpenAI-safe name, or glob pattern)'),
+    action: z
+      .enum(['allow', 'deny', 'set_level', 'clear', 'note', 'check'])
+      .describe('Feedback action'),
+    level: z
+      .enum(TOOL_ACCESS_LEVELS)
+      .optional()
+      .describe('Required when action is set_level'),
+    note: z.string().optional().describe('Optional feedback note'),
+    source: z.string().optional().describe('Optional feedback source'),
+  }).superRefine((data, ctx) => {
+    if (data.action !== 'check' && (!data.tool_name || data.tool_name.trim().length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['tool_name'],
+        message: 'tool_name is required unless action is check.',
+      });
+    }
+    if (data.action === 'set_level' && !data.level) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['level'],
+        message: 'level is required when action is set_level.',
+      });
+    }
+  });
+
+  server.registerTool(
+    'tool_feedback',
+    {
+      title: 'Tool feedback',
+      description:
+        'Record tool feedback and update per-role tool access overrides (allow/deny/set_level). Accepts glob patterns in tool_name.',
+      inputSchema: toolFeedbackSchema,
+    },
+    async ({ role, tool_name, action, level, note, source }) => {
+      if (action === 'check') {
+        const current = await feedbackStore.read();
+        return formatResult({
+          ok: true,
+          overrides: current.overrides,
+          history: current.history.filter((entry) => entry.role === role).slice(-10),
+        });
+      }
+      const resolvedName = tool_name
+        ? toolRegistry.resolveToolName(tool_name) ?? tool_name
+        : '';
+      const updated = await feedbackStore.applyFeedback({
+        role: role as AgentRole,
+        toolName: resolvedName,
+        action,
+        level,
+        note,
+        source,
+      });
+      currentToolOverrides = updated.overrides;
+      toolRegistry.setAccessOverrides(currentToolOverrides);
+      return formatResult({ ok: true, overrides: currentToolOverrides });
+    },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Tool: tools_status
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const toolsStatusSchema = z.object({
+    role: z
+      .union([
+        z.literal('planner'),
+        z.literal('code'),
+        z.literal('analysis'),
+        z.literal('research'),
+        z.literal('review'),
+        z.literal('test'),
+      ])
+      .optional()
+      .describe('Optional role to filter tools by effective access'),
+    refresh: z.boolean().optional().describe('Refresh tool discovery before reporting status'),
+    include_all: z
+      .boolean()
+      .optional()
+      .describe('Include tools not allowed for the role (adds allowed=false)'),
+    include_tools: z
+      .boolean()
+      .optional()
+      .describe('Include full tool list when role is not specified'),
+  });
+
+  server.registerTool(
+    'tools_status',
+    {
+      title: 'Tools status',
+      description:
+        'Report MCP tool discovery status and effective tool access by role. Use refresh to force discovery.',
+      inputSchema: toolsStatusSchema,
+    },
+    async ({ role, refresh, include_all, include_tools }) => {
+      let refreshError: string | null = null;
+      if (refresh) {
+        try {
+          await toolRegistry.refresh();
+          toolRegistry.setAccessOverrides(currentToolOverrides);
+        } catch (error) {
+          refreshError = error instanceof Error ? error.message : String(error);
+        }
+      }
+
+      const servers = clientManager.getServerSummary();
+      const allTools = toolRegistry.getToolsCatalog();
+      const roleTools = role
+        ? toolRegistry.getToolsCatalogForRole(role as AgentRole, Boolean(include_all))
+        : undefined;
+      const tools = role ? roleTools : include_tools ? allTools : undefined;
+
+      return formatResult({
+        ok: !refreshError,
+        refreshed: Boolean(refresh),
+        refreshError,
+        servers,
+        totalTools: allTools.length,
+        role: role ?? null,
+        roleAccessLevel: role ? toolRegistry.getEffectiveAccessLevel(role as AgentRole) : null,
+        tools,
+        overrides: currentToolOverrides,
+      });
     },
   );
 
@@ -212,9 +466,20 @@ async function main(): Promise<void> {
   // Start server
   // ─────────────────────────────────────────────────────────────────────────────
 
+  const shutdown = async () => {
+    await clientManager.disconnectAll();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('mcp-subagents server listening on stdio');
+  void initTooling().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Background MCP tool discovery failed: ${message}`);
+  });
 }
 
 // Entry point

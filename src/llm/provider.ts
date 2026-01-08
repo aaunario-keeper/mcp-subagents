@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { readFileSync } from 'fs';
 import * as http from 'http';
 import * as https from 'https';
-import { ChatMessage } from '../types.js';
+import { ChatMessage, ToolCall } from '../types.js';
 
 /** JSON format instruction to append to system prompts */
 const JSON_FORMAT_INSTRUCTION =
@@ -86,6 +86,23 @@ export interface CompletionOptions {
   maxTokens?: number;
   /** Optional OpenAI API key override for direct fallback. */
   apiKey?: string;
+  /** OpenAI function calling tool definitions. */
+  tools?: object[];
+  toolChoice?:
+    | 'auto'
+    | 'required'
+    | 'none'
+    | { type: 'function'; function: { name: string } };
+}
+
+export interface CompletionResult {
+  content: string | null;
+  toolCalls?: ToolCall[];
+  finishReason: 'stop' | 'tool_calls' | 'length';
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+  };
 }
 
 function appendJsonInstruction(
@@ -106,7 +123,7 @@ function appendJsonInstruction(
   const systemIndex = messages.findIndex((message) => message.role === 'system');
   const updated = messages.map((message) => ({ ...message }));
 
-  if (systemIndex >= 0) {
+  if (systemIndex >= 0 && updated[systemIndex].role === 'system') {
     updated[systemIndex] = {
       ...updated[systemIndex],
       content: `${updated[systemIndex].content}\n\n${JSON_FORMAT_INSTRUCTION}`,
@@ -133,7 +150,7 @@ function isSamplingMethodMissing(error: unknown): boolean {
  * Interface for LLM providers that can generate completions.
  */
 export interface LLMProvider {
-  complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string>;
+  complete(messages: ChatMessage[], options?: CompletionOptions): Promise<CompletionResult>;
 }
 
 interface DirectOpenAiOptions {
@@ -143,7 +160,7 @@ interface DirectOpenAiOptions {
   defaultTemperature: number;
 }
 
-class DirectOpenAiProvider implements LLMProvider {
+export class DirectOpenAiProvider implements LLMProvider {
   private apiKey?: string;
   private baseUrl: string;
   private defaultModel: string;
@@ -162,7 +179,10 @@ class DirectOpenAiProvider implements LLMProvider {
     return Boolean(this.apiKey);
   }
 
-  async complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string> {
+  async complete(
+    messages: ChatMessage[],
+    options?: CompletionOptions,
+  ): Promise<CompletionResult> {
     const apiKey = options?.apiKey ?? this.apiKey;
     if (!apiKey) {
       throw new Error(
@@ -172,13 +192,31 @@ class DirectOpenAiProvider implements LLMProvider {
     const preparedMessages = appendJsonInstruction(messages, options?.responseFormat);
     const body = {
       model: options?.model ?? this.defaultModel,
-      messages: preparedMessages.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
+      messages: preparedMessages.map((message) => {
+        if (message.role === 'tool') {
+          return {
+            role: 'tool',
+            content: message.content,
+            tool_call_id: message.toolCallId,
+          };
+        }
+        if (message.role === 'assistant' && message.toolCalls) {
+          return {
+            role: 'assistant',
+            content: message.content,
+            tool_calls: message.toolCalls,
+          };
+        }
+        return {
+          role: message.role,
+          content: message.content,
+        };
+      }),
       temperature: options?.temperature ?? this.defaultTemperature,
       max_tokens: options?.maxTokens ?? 4096,
       response_format: options?.responseFormat === 'json' ? { type: 'json_object' } : undefined,
+      tools: options?.tools,
+      tool_choice: options?.toolChoice,
     };
 
     const url = `${this.baseUrl.replace(/\/$/, '')}/chat/completions`;
@@ -201,13 +239,32 @@ class DirectOpenAiProvider implements LLMProvider {
       throw new Error(errorMessage);
     }
 
-    const text = (payload as { choices?: Array<{ message?: { content?: string } }> })
-      ?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) {
+    const typed = payload as {
+      choices?: Array<{
+        message?: { content?: string | null; tool_calls?: ToolCall[] };
+        finish_reason?: 'stop' | 'tool_calls' | 'length';
+      }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    };
+    const choice = typed?.choices?.[0];
+    const message = choice?.message;
+    const content = message?.content ?? null;
+    const toolCalls = message?.tool_calls;
+    const finishReason = choice?.finish_reason ?? 'stop';
+    const rawUsage = typed?.usage;
+
+    if (content === null && (!toolCalls || toolCalls.length === 0)) {
       throw new Error('OpenAI response missing text content.');
     }
 
-    return text;
+    return {
+      content: typeof content === 'string' ? content : null,
+      toolCalls,
+      finishReason,
+      usage: rawUsage
+        ? { promptTokens: rawUsage.prompt_tokens ?? 0, completionTokens: rawUsage.completion_tokens ?? 0 }
+        : undefined,
+    };
   }
 }
 
@@ -234,16 +291,24 @@ export class McpSamplingProvider implements LLMProvider {
     this.fallback = opts.fallback;
   }
 
-  async complete(messages: ChatMessage[], options?: CompletionOptions): Promise<string> {
+  async complete(
+    messages: ChatMessage[],
+    options?: CompletionOptions,
+  ): Promise<CompletionResult> {
     const preparedMessages = appendJsonInstruction(messages, options?.responseFormat);
     // Extract system prompt (MCP sampling uses systemPrompt field, not a system message)
-    const systemPrompt = preparedMessages.find((m) => m.role === 'system')?.content;
+    const systemPrompt = preparedMessages.find(
+      (m): m is { role: 'system'; content: string } => m.role === 'system',
+    )?.content;
 
     // Convert non-system messages to MCP format (only user/assistant allowed)
     const mcpMessages = preparedMessages
-      .filter((m) => m.role !== 'system')
+      .filter(
+        (m): m is { role: 'user' | 'assistant'; content: string } =>
+          (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string',
+      )
       .map((m) => ({
-        role: m.role as 'user' | 'assistant',
+        role: m.role,
         content: { type: 'text' as const, text: m.content },
       }));
 
@@ -295,7 +360,7 @@ export class McpSamplingProvider implements LLMProvider {
       throw new Error('MCP client returned empty text content from createMessage.');
     }
 
-    return text;
+    return { content: text, finishReason: 'stop' };
   }
 }
 

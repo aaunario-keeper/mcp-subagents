@@ -1,5 +1,69 @@
 /** Available agent roles in the system */
-export type AgentRole = 'planner' | 'code' | 'analysis';
+export type AgentRole = 'planner' | 'code' | 'analysis' | 'research' | 'review' | 'test';
+
+export type ToolAccessLevel = 'none' | 'read' | 'write' | 'execute' | 'admin';
+
+export const TOOL_ACCESS_LEVELS: ToolAccessLevel[] = ['none', 'read', 'write', 'execute', 'admin'];
+
+export const TOOL_ACCESS_LEVEL_ORDER: Record<ToolAccessLevel, number> = {
+  none: 0,
+  read: 1,
+  write: 2,
+  execute: 3,
+  admin: 4,
+};
+
+/** Tool permissions per role (prefixed with server name). */
+export const ROLE_TOOL_PERMISSIONS: Record<AgentRole, string[]> = {
+  planner: [],
+  code: [
+    'smart-io:read_file',
+    'smart-io:edit_file',
+    'smart-io:create_file',
+    'smart-io:run_shell',
+  ],
+  analysis: [
+    'smart-io:read_file',
+    'smart-io:grep_file',
+    'smart-io:read_log',
+    'smart-io:list_processes',
+    'smart-io:list_directory_tree',
+    'smart-io:find_files',
+    'smart-io:run_shell',
+    'smart-io:run_powershell',
+  ],
+  research: [
+    '*:web_search',
+    '*:web_fetch',
+    'smart-io:read_file',
+    'smart-io:grep_file',
+    'keeper-memory*:*',
+  ],
+  review: [
+    'smart-io:read_file',
+    'smart-io:grep_file',
+    'smart-io:syntax_check',
+    'smart-io:check_git_status',
+  ],
+  test: ['smart-io:run_shell', 'smart-io:read_file', 'smart-io:create_file', 'smart-io:read_log'],
+};
+
+/** Default maximum tool access level per role. */
+export const ROLE_TOOL_ACCESS_LEVELS: Record<AgentRole, ToolAccessLevel> = {
+  planner: 'none',
+  analysis: 'execute',
+  research: 'read',
+  review: 'read',
+  code: 'execute',
+  test: 'execute',
+};
+
+/** Which roles can use tools when available. */
+export const TOOL_USING_ROLES: AgentRole[] = ['code', 'analysis', 'research', 'review', 'test'];
+
+/** Roles that are not allowed to delegate to child agents.
+ * Only 'planner' can delegate - all tool-using roles must focus on their task. */
+export const NON_DELEGATING_ROLES: AgentRole[] = ['code', 'analysis', 'research', 'review', 'test'];
 
 /**
  * Request to execute an agent with a specific role and objective.
@@ -53,17 +117,43 @@ export interface AgentResult {
   children: AgentResult[];
   /** Raw LLM response (for debugging) */
   raw?: string;
+  /** Token usage for this agent (excluding children) */
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
 }
 
 /**
  * A chat message for LLM completions.
  */
-export interface ChatMessage {
-  /** Message role (system, user, or assistant) */
-  role: 'system' | 'user' | 'assistant';
-  /** Message content */
-  content: string;
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
 }
+
+export type ChatMessage =
+  | {
+      /** Message role */
+      role: 'system' | 'user';
+      /** Message content */
+      content: string;
+    }
+  | {
+      role: 'assistant';
+      content: string | null;
+      toolCalls?: ToolCall[];
+    }
+  | {
+      role: 'tool';
+      content: string;
+      toolCallId: string;
+    };
 
 /**
  * Entry in the session log/scratchpad.

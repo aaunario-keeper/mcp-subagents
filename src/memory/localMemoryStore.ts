@@ -3,10 +3,11 @@ import path from 'path';
 import { SessionLogEntry } from '../types.js';
 
 /**
- * Sanitize session ID to be filesystem-safe.
+ * Normalize a session ID to be filesystem-safe and consistent.
  */
-function sanitizeSessionId(sessionId: string): string {
-  return sessionId.replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+export function normalizeSessionId(sessionId: string): string {
+  const normalized = sessionId.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  return normalized.length > 0 ? normalized : 'default';
 }
 
 /**
@@ -56,16 +57,22 @@ class AsyncMutex {
   }
 }
 
+/** Default maximum session log size in bytes (1 MB) */
+const DEFAULT_MAX_LOG_BYTES = 1_000_000;
+
 /**
  * File-based session memory store with JSON persistence.
  * Thread-safe for concurrent access within the same process.
+ * Includes size limits to prevent unbounded log growth.
  */
 export class LocalHybridMemoryStore {
   private baseDir: string;
   private mutex = new AsyncMutex();
+  private maxLogBytes: number;
 
-  constructor(baseDir: string) {
+  constructor(baseDir: string, maxLogBytes: number = DEFAULT_MAX_LOG_BYTES) {
     this.baseDir = baseDir;
+    this.maxLogBytes = maxLogBytes;
   }
 
   private async ensureDir(): Promise<void> {
@@ -73,7 +80,7 @@ export class LocalHybridMemoryStore {
   }
 
   private sessionPath(sessionId: string): string {
-    const safe = sanitizeSessionId(sessionId);
+    const safe = normalizeSessionId(sessionId);
     return path.join(this.baseDir, `${safe}.json`);
   }
 
@@ -133,6 +140,7 @@ export class LocalHybridMemoryStore {
   /**
    * Append a log entry to a session.
    * Thread-safe: uses mutex to prevent concurrent writes from losing data.
+   * Automatically truncates old entries if the log exceeds maxLogBytes.
    *
    * @param sessionId - Session identifier
    * @param entry - Log entry to append
@@ -140,10 +148,27 @@ export class LocalHybridMemoryStore {
   async append(sessionId: string, entry: SessionLogEntry): Promise<void> {
     await this.mutex.withLock(sessionId, async () => {
       await this.ensureDir();
-      const existing = await this.readInternal(sessionId);
+      let existing = await this.readInternal(sessionId);
       existing.push(entry);
+
+      // Enforce size limit by removing oldest entries
+      let content = JSON.stringify(existing, null, 2);
+      while (Buffer.byteLength(content, 'utf8') > this.maxLogBytes && existing.length > 1) {
+        // Remove oldest entry and add truncation marker if not already present
+        const removed = existing.shift()!;
+        if (existing[0]?.meta?.type !== 'truncation_marker') {
+          existing.unshift({
+            role: 'system',
+            message: `Session log truncated. Removed entries older than ${removed.timestamp}.`,
+            timestamp: new Date().toISOString(),
+            meta: { type: 'truncation_marker' },
+          });
+        }
+        content = JSON.stringify(existing, null, 2);
+      }
+
       const filePath = this.sessionPath(sessionId);
-      await fs.writeFile(filePath, JSON.stringify(existing, null, 2), 'utf8');
+      await fs.writeFile(filePath, content, 'utf8');
     });
   }
 
