@@ -63,7 +63,8 @@ export class McpClientManager {
 
   async connect(config: McpServerConfig): Promise<void> {
     if (this.servers.has(config.name)) {
-      return;
+      // Server already connected - disconnect and reconnect to refresh
+      await this.disconnect(config.name);
     }
 
     const env = config.env ? { ...toEnvRecord(process.env), ...config.env } : undefined;
@@ -92,7 +93,7 @@ export class McpClientManager {
       tools = await this.listAllTools(client);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`Failed to list tools for MCP server "${config.name}": ${message}`);
+      console.error(`Failed to list tools for MCP server "${config.name}": ${message}`); throw new Error(message);
     }
     this.servers.set(config.name, { name: config.name, client, transport, tools });
   }
@@ -142,7 +143,7 @@ export class McpClientManager {
   async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
     const resolved = this.resolveTool(toolName);
     if (!resolved) {
-      throw new Error(`Tool not found: ${toolName}`);
+      throw new Error(`Tool not found: ${toolName}`); // Consider adding available tools in the error message.
     }
 
     const { serverName, tool } = resolved;
@@ -161,6 +162,20 @@ export class McpClientManager {
        this.toolCallRetries,
        this.toolCallRetryDelayMs,
      );
+  }
+
+  async disconnect(serverName: string): Promise<void> {
+    const server = this.servers.get(serverName);
+    if (!server) {
+      return;
+    }
+    this.servers.delete(serverName);
+    try {
+      await server.client.close();
+    } catch {}
+    try {
+      await server.transport.close();
+    } catch {}
   }
 
   async disconnectAll(): Promise<void> {

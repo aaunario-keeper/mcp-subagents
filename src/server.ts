@@ -176,6 +176,17 @@ async function main(): Promise<void> {
     context: z.string().optional().describe('Additional context for the planner'),
     session_id: z.string().optional().describe('Session ID for scratchpad persistence'),
     max_depth: z.number().int().min(1).max(8).optional().describe('Maximum delegation depth (1-8)'),
+    max_delegations: z
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .optional()
+      .describe('Maximum delegations per agent response (default 2, max 10). Increase for broader analysis.'),
+    model: z
+      .string()
+      .optional()
+      .describe('Model to use (default gpt-4o-mini). Use gpt-4o or gpt-4-turbo for better reasoning.'),
     openai_api_key: z
       .string()
       .min(1)
@@ -190,7 +201,7 @@ async function main(): Promise<void> {
       description: 'Decompose a task, delegate to subagents, and return a concise plan with results.',
       inputSchema: plannerSchema,
     },
-    async ({ task, context, session_id, max_depth, openai_api_key }) => {
+    async ({ task, context, session_id, max_depth, max_delegations, model, openai_api_key }) => {
       const sessionId = normalizeSessionId(session_id ?? 'default');
       const result = await orchestrator.run({
         role: 'planner',
@@ -199,6 +210,8 @@ async function main(): Promise<void> {
         apiKey: openai_api_key,
         sessionId,
         maxDepth: max_depth,
+        maxDelegations: max_delegations,
+        model,
       });
       return formatResult(result);
     },
@@ -223,6 +236,17 @@ async function main(): Promise<void> {
     context: z.string().optional().describe('Additional context'),
     session_id: z.string().optional().describe('Session ID for scratchpad persistence'),
     max_depth: z.number().int().min(1).max(8).optional().describe('Maximum delegation depth (1-8)'),
+    max_delegations: z
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .optional()
+      .describe('Maximum delegations per agent response (default 2, max 10). Increase for broader analysis.'),
+    model: z
+      .string()
+      .optional()
+      .describe('Model to use (default gpt-4o-mini). Use gpt-4o or gpt-4-turbo for better reasoning.'),
     openai_api_key: z
       .string()
       .min(1)
@@ -237,7 +261,7 @@ async function main(): Promise<void> {
       description: 'Run a specific agent role with optional recursive delegation.',
       inputSchema: subagentSchema,
     },
-    async ({ role, objective, context, session_id, max_depth, openai_api_key }) => {
+    async ({ role, objective, context, session_id, max_depth, max_delegations, model, openai_api_key }) => {
       const sessionId = normalizeSessionId(session_id ?? 'default');
       const result = await orchestrator.run({
         role: role as AgentRole,
@@ -246,6 +270,8 @@ async function main(): Promise<void> {
         apiKey: openai_api_key,
         sessionId,
         maxDepth: max_depth,
+        maxDelegations: max_delegations,
+        model,
       });
       return formatResult(result);
     },
@@ -255,8 +281,20 @@ async function main(): Promise<void> {
   // Tool: session_log
   // ─────────────────────────────────────────────────────────────────────────────
 
-  const sessionSchema = z.object({
+  const sessionLogSchema = z.object({
     session_id: z.string().optional().describe('Session ID (defaults to "default")'),
+    offset: z.number().int().min(0).optional().describe('Number of entries to skip from the start'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe('Maximum number of entries to return (default 50, max 100)'),
+    summary_only: z
+      .boolean()
+      .optional()
+      .describe('If true, return only entry count and byte size without full content'),
   });
 
   server.registerTool(
@@ -264,12 +302,38 @@ async function main(): Promise<void> {
     {
       title: 'Session log',
       description: 'Return the persisted scratchpad for a session.',
-      inputSchema: sessionSchema,
+      inputSchema: sessionLogSchema,
     },
-    async ({ session_id }) => {
+    async ({ session_id, offset, limit, summary_only }) => {
       const sessionId = normalizeSessionId(session_id ?? 'default');
       const log = await memory.read(sessionId);
-      return formatResult({ session_id: sessionId, entries: log });
+
+      // Summary mode - just return stats without full content
+      if (summary_only) {
+        const totalBytes = Buffer.byteLength(JSON.stringify(log), 'utf8');
+        return formatResult({
+          session_id: sessionId,
+          entry_count: log.length,
+          total_bytes: totalBytes,
+          oldest_entry: log[0]?.timestamp ?? null,
+          newest_entry: log[log.length - 1]?.timestamp ?? null,
+        });
+      }
+
+      // Apply pagination
+      const startIdx = offset ?? 0;
+      const maxEntries = limit ?? 50;
+      const paginatedLog = log.slice(startIdx, startIdx + maxEntries);
+
+      return formatResult({
+        session_id: sessionId,
+        total_entries: log.length,
+        offset: startIdx,
+        limit: maxEntries,
+        returned: paginatedLog.length,
+        has_more: startIdx + paginatedLog.length < log.length,
+        entries: paginatedLog,
+      });
     },
   );
 
@@ -277,12 +341,16 @@ async function main(): Promise<void> {
   // Tool: session_clear
   // ─────────────────────────────────────────────────────────────────────────────
 
+  const sessionClearSchema = z.object({
+    session_id: z.string().optional().describe('Session ID (defaults to "default")'),
+  });
+
   server.registerTool(
     'session_clear',
     {
       title: 'Session clear',
       description: 'Clear persisted scratchpad for a session and reset agent count.',
-      inputSchema: sessionSchema,
+      inputSchema: sessionClearSchema,
     },
     async ({ session_id }) => {
       const sessionId = normalizeSessionId(session_id ?? 'default');

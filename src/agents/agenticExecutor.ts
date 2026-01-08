@@ -43,6 +43,48 @@ export class AgenticExecutor {
     return Boolean(apiKeyOverride) || this.hasDefaultApiKey;
   }
 
+  /**
+   * Retry synthesis when the model used tools but returned no final content.
+   * Sends a follow-up prompt asking the model to synthesize its findings.
+   */
+  private async retrySynthesis(
+    messages: ChatMessage[],
+    options?: {
+      apiKey?: string;
+      model?: string;
+      temperature?: number;
+      responseFormat?: 'text' | 'json';
+    },
+  ): Promise<string | null> {
+    const synthesisPrompt: ChatMessage = {
+      role: 'user',
+      content:
+        'You executed tool calls but did not provide a final response. ' +
+        'Based on the tool results above, provide your final JSON response with summary, notes, and any delegations. ' +
+        'Do NOT call any more tools - just synthesize your findings.',
+    };
+
+    try {
+      const result = await this.llm([...messages, synthesisPrompt], {
+        model: options?.model,
+        temperature: options?.temperature,
+        responseFormat: options?.responseFormat ?? 'json',
+        apiKey: options?.apiKey,
+        tools: [], // No tools - force synthesis
+        toolChoice: 'none',
+      });
+
+      if (typeof result.content === 'string' && result.content.trim().length > 0) {
+        return result.content;
+      }
+    } catch (error) {
+      // Synthesis retry failed, fall through to fallback
+      console.error('Synthesis retry failed:', error instanceof Error ? error.message : error);
+    }
+
+    return null;
+  }
+
   async execute(
     systemPrompt: string,
     userMessage: string,
@@ -90,6 +132,17 @@ export class AgenticExecutor {
 
       const toolCalls = result.toolCalls ?? [];
       if (result.finishReason === 'stop' || toolCalls.length === 0) {
+        // If we have tool history but no content, try a synthesis retry
+        if (lastContent.trim().length === 0 && toolCallHistory.length > 0) {
+          const synthesized = await this.retrySynthesis(messages, options);
+          if (synthesized) {
+            return {
+              finalContent: synthesized,
+              toolCallHistory,
+              iterations: iteration + 1,
+            };
+          }
+        }
         const fallback = buildFallbackContent(options?.responseFormat, toolCallHistory);
         return {
           finalContent: lastContent.trim().length > 0 ? lastContent : fallback,
@@ -136,6 +189,18 @@ export class AgenticExecutor {
       }
     }
 
+    // Final synthesis retry if we have tool history but no content
+    if (lastContent.trim().length === 0 && toolCallHistory.length > 0) {
+      const synthesized = await this.retrySynthesis(messages, options);
+      if (synthesized) {
+        return {
+          finalContent: synthesized,
+          toolCallHistory,
+          iterations: this.maxIterations,
+        };
+      }
+    }
+
     const fallback = buildFallbackContent(options?.responseFormat, toolCallHistory);
     return {
       finalContent: lastContent.trim().length > 0 ? lastContent : fallback,
@@ -160,13 +225,34 @@ function buildFallbackContent(
   if (format !== 'json') {
     return 'No response content returned.';
   }
-  const summary =
-    history.length > 0
-      ? 'Tool calls executed but the model returned no final answer.'
-      : 'Model returned empty response.';
-  const notes =
-    history.length > 0
-      ? history.slice(-3).map((entry) => `Tool ${entry.tool} result: ${entry.result}`)
-      : ['Retry the request.'];
+
+  // Analyze tool call results to provide a better fallback
+  const successfulCalls = history.filter((e) => !e.error);
+  const failedCalls = history.filter((e) => e.error);
+
+  let summary: string;
+  if (history.length === 0) {
+    summary = 'Model returned empty response without using any tools.';
+  } else if (failedCalls.length === history.length) {
+    summary = `All ${failedCalls.length} tool call(s) failed. See errors below.`;
+  } else if (successfulCalls.length > 0) {
+    summary = `Executed ${successfulCalls.length} tool call(s) successfully but model did not synthesize results.`;
+  } else {
+    summary = 'Tool calls executed but the model returned no final answer.';
+  }
+
+  const notes: string[] = [];
+  // Add successful results (limited)
+  for (const entry of successfulCalls.slice(-3)) {
+    notes.push(`Tool ${entry.tool} result: ${entry.result}`);
+  }
+  // Add error details
+  for (const entry of failedCalls.slice(-2)) {
+    notes.push(`Tool ${entry.tool} ERROR: ${entry.error}`);
+  }
+  if (notes.length === 0) {
+    notes.push('No tool results to report. Consider retrying with a more specific objective.');
+  }
+
   return toJsonSafe({ summary, notes, delegations: [] }, '');
 }

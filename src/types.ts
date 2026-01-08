@@ -83,6 +83,10 @@ export interface AgentRequest {
   depth?: number;
   /** Maximum allowed recursion depth */
   maxDepth?: number;
+  /** Maximum delegations per agent response (overrides config default) */
+  maxDelegations?: number;
+  /** Model to use (overrides config default, e.g., 'gpt-4o' for better reasoning) */
+  model?: string;
 }
 
 /**

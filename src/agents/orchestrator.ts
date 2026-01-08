@@ -173,6 +173,8 @@ export class AgentOrchestrator {
   async run(request: AgentRequest): Promise<AgentResult> {
     const depth = request.depth ?? 0;
     const maxDepth = request.maxDepth ?? this.defaults.maxDepth;
+    const maxDelegations = request.maxDelegations ?? CONFIG.maxDelegationsPerAgent;
+    const model = request.model ?? this.defaults.model;
     const sessionId = request.sessionId ?? 'default';
 
     // Check and increment agent count for this session (gremlin containment)
@@ -229,6 +231,7 @@ export class AgentOrchestrator {
     const systemPrompt = buildSystemPrompt(request.role, maxDepth, ROLES, {
       allowDelegation,
       tooling,
+      maxDelegations,
     });
     const userPrompt = buildUserMessage({
       objective: request.objective,
@@ -277,7 +280,7 @@ export class AgentOrchestrator {
     } else if (shouldUseTools && this.agenticExecutor) {
       const execResult = await this.agenticExecutor.execute(systemPrompt, userPrompt, request.role, {
         apiKey: request.apiKey,
-        model: this.defaults.model,
+        model,
         temperature: this.defaults.temperature,
         responseFormat: 'json',
         toolChoice: forceToolUse ? 'required' : 'auto',
@@ -286,7 +289,7 @@ export class AgentOrchestrator {
       await this.logToolCalls(sessionId, execResult.toolCallHistory, depth, maxDepth);
     } else {
       const completion = await this.llm(messages, {
-        model: this.defaults.model,
+        model,
         temperature: this.defaults.temperature,
         responseFormat: 'json',
         apiKey: request.apiKey,
@@ -301,7 +304,20 @@ export class AgentOrchestrator {
       }
     }
 
-    parsed = parseAgentResponse(raw);
+    // Parse with retry on validation failure
+    const parseResult = parseAgentResponse(raw);
+    if (!parseResult.valid && !shouldUseTools) {
+      // Retry with a reformatting prompt for non-tool agents
+      const retryResponse = await this.retryWithSchemaFix(messages, raw, model, request.apiKey);
+      if (retryResponse) {
+        raw = retryResponse;
+        parsed = parseAgentResponse(raw).data;
+      } else {
+        parsed = parseResult.data;
+      }
+    } else {
+      parsed = parseResult.data;
+    }
     if (toolAccessSkipped) {
       parsed = {
         ...parsed,
@@ -317,7 +333,24 @@ export class AgentOrchestrator {
         notes: [...(parsed.notes ?? []), note],
       };
     }
-    const delegations = this.prepareDelegations(parsed.delegations ?? [], depth, maxDepth, allowDelegation);
+    const { delegations, truncatedCount } = this.prepareDelegations(
+      parsed.delegations ?? [],
+      depth,
+      maxDepth,
+      maxDelegations,
+      allowDelegation,
+    );
+
+    // Notify if delegations were truncated
+    if (truncatedCount > 0) {
+      parsed = {
+        ...parsed,
+        notes: [
+          ...(parsed.notes ?? []),
+          `${truncatedCount} delegation(s) skipped due to limit (max ${maxDelegations} per agent).`,
+        ],
+      };
+    }
 
     // Execute delegated child agents
     const children: AgentResult[] = [];
@@ -330,6 +363,8 @@ export class AgentOrchestrator {
         sessionId,
         depth: depth + 1,
         maxDepth,
+        maxDelegations,
+        model,
       });
       children.push(child);
     }
@@ -359,21 +394,72 @@ export class AgentOrchestrator {
 
   /**
    * Filter and limit delegations based on depth and validity.
+   * Returns the filtered delegations and count of any that were truncated.
    */
   private prepareDelegations(
     delegations: AgentDelegation[],
     depth: number,
     maxDepth: number,
+    maxDelegations: number,
     allowDelegation: boolean,
-  ): AgentDelegation[] {
+  ): { delegations: AgentDelegation[]; truncatedCount: number } {
     // Don't allow delegations if we're at max depth
     if (!allowDelegation || depth + 1 >= maxDepth) {
-      return [];
+      return { delegations: [], truncatedCount: delegations.length };
     }
 
-    return delegations
-      .filter((d) => ROLES.includes(d.role))
-      .slice(0, CONFIG.maxDelegationsPerAgent);
+    const valid = delegations.filter((d) => ROLES.includes(d.role));
+    const truncated = valid.slice(0, maxDelegations);
+    return {
+      delegations: truncated,
+      truncatedCount: valid.length - truncated.length,
+    };
+  }
+
+  /**
+   * Retry LLM call when JSON schema validation fails.
+   * Asks the model to reformat its response to match the expected schema.
+   */
+  private async retryWithSchemaFix(
+    messages: ChatMessage[],
+    invalidResponse: string,
+    model: string,
+    apiKey?: string,
+  ): Promise<string | null> {
+    const fixPrompt: ChatMessage = {
+      role: 'user',
+      content: `Your previous response was not valid JSON or was missing required fields. Please reformat as valid JSON with these fields:
+- summary (string, required): Brief summary of your work
+- notes (array of strings, optional): Key observations
+- delegations (array of {role, objective}, optional): Work to delegate
+- rationale (string, optional): Why you took this approach
+- risks (array of strings, optional): Identified risks
+
+Previous response that needs fixing:
+${invalidResponse.slice(0, 1000)}
+
+Return ONLY valid JSON, no markdown fences or explanation.`,
+    };
+
+    try {
+      const result = await this.llm([...messages, fixPrompt], {
+        model,
+        temperature: 0.1, // Low temperature for formatting task
+        responseFormat: 'json',
+        apiKey,
+      });
+
+      if (result.content && result.content.trim().length > 0) {
+        const testParse = parseAgentResponse(result.content);
+        if (testParse.valid) {
+          return result.content;
+        }
+      }
+    } catch (error) {
+      console.error('Schema fix retry failed:', error instanceof Error ? error.message : error);
+    }
+
+    return null;
   }
 
   private async logToolCalls(
@@ -405,25 +491,47 @@ export class AgentOrchestrator {
   }
 }
 
+interface ParseResult {
+  valid: boolean;
+  data: z.infer<typeof AgentResponseSchema>;
+  errors?: string[];
+}
+
 /**
  * Parse and validate the raw LLM response into a structured agent response.
- * Falls back to a simple summary if parsing fails.
+ * Returns validity flag and fallback data if parsing fails.
  */
-function parseAgentResponse(raw: string): z.infer<typeof AgentResponseSchema> {
+function parseAgentResponse(raw: string): ParseResult {
   const parsedJson = safeParseJson<unknown>(raw);
   if (parsedJson) {
     const result = AgentResponseSchema.safeParse(parsedJson);
     if (result.success) {
-      return result.data;
+      return { valid: true, data: result.data };
     }
     // Log validation errors for debugging
-    console.error('Agent response validation failed:', result.error.issues);
+    const errors = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`);
+    console.error('Agent response validation failed:', errors);
+    return {
+      valid: false,
+      data: {
+        summary: typeof (parsedJson as Record<string, unknown>).summary === 'string'
+          ? (parsedJson as Record<string, unknown>).summary as string
+          : raw,
+        delegations: [],
+        notes: ['Model response had validation errors; some fields may be missing.'],
+      },
+      errors,
+    };
   }
 
   // Fallback: treat raw content as summary
   return {
-    summary: raw,
-    delegations: [],
-    notes: ['Model response was not valid JSON; returning raw content.'],
+    valid: false,
+    data: {
+      summary: raw,
+      delegations: [],
+      notes: ['Model response was not valid JSON; returning raw content.'],
+    },
+    errors: ['Invalid JSON'],
   };
 }

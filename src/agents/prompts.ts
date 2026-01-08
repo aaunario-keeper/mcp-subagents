@@ -15,12 +15,16 @@ const ROLE_BRIEFS: Record<AgentRole, string> = {
 };
 
 const ROLE_GUIDELINES: Record<AgentRole, string> = {
-  planner: 'Prefer clear, staged plans and delegate only when it meaningfully helps.',
-  code: 'Make minimal, correct changes. Use find_files to locate files before reading. Reference specific file:line in notes.',
-  analysis: 'Surface risks with specific file:line references and concrete evidence. Use find_files first if paths unknown.',
-  research: 'Cite sources with URLs or file:line references. Note uncertainty when information is incomplete.',
-  review: 'Report issues as file:line with severity. Use find_files to discover structure before reading files.',
-  test: 'Reference test files by path. Report pass/fail with specific file:line for failures.',
+  planner:
+    'Prefer clear, staged plans and delegate only when it meaningfully helps.',
+  code: 'ALWAYS use find_files or list_directory_tree BEFORE read_file to discover exact file paths. Do NOT try to read directories as files. Reference specific file:line in notes. NEVER claim to have made changes unless you actually used edit_file.',
+  analysis:
+    'Surface risks with specific file:line references and concrete evidence. ALWAYS use find_files first to discover file paths - never guess. Verify line numbers by reading the actual file.',
+  research:
+    'Cite sources with URLs or file:line references. Note uncertainty when information is incomplete. Only reference files and functions that actually exist in the project.',
+  review:
+    'Report issues as file:line with severity. ALWAYS use find_files to discover structure before reading files. Do NOT try to read directories as files. Verify all line numbers against actual file content.',
+  test: 'Reference test files by path. Report pass/fail with specific file:line for failures. Only suggest test files for modules that actually exist in the project. Use find_files first.',
 };
 
 export interface ToolingPrompt {
@@ -34,7 +38,24 @@ export interface ToolingPrompt {
 export interface SystemPromptOptions {
   allowDelegation: boolean;
   tooling: ToolingPrompt;
+  /** Maximum delegations allowed per agent (for planner guidance) */
+  maxDelegations?: number;
 }
+
+const TOOL_SELECTION_GUIDE = `
+TOOL SELECTION WORKFLOW:
+1. DISCOVER paths first: find_files(pattern) or list_directory_tree(path) - never guess paths
+2. SEARCH content: grep_file(path, pattern) to find specific code
+3. READ files: read_file(path) only after you know the exact path exists
+4. MODIFY files: edit_file(path, find_text, replace_text) - requires exact text match
+5. RUN commands: run_shell(command) for builds, tests, git operations
+
+COMMON MISTAKES TO AVOID:
+- Do NOT read_file on a directory - use list_directory_tree instead
+- Do NOT guess file paths - use find_files first
+- Do NOT claim edit success without checking edit_file returned success
+- Do NOT search the entire project when you can narrow to a directory
+`.trim();
 
 function buildToolingLine(tooling: ToolingPrompt): string {
   if (tooling.status === 'available') {
@@ -42,7 +63,7 @@ function buildToolingLine(tooling: ToolingPrompt): string {
     const cwdNote = tooling.workingDirectory
       ? ` Working directory: ${tooling.workingDirectory}. Always use absolute paths or paths relative to this directory.`
       : '';
-    return `Tool access is enabled.${summary}${cwdNote} Use tools to verify facts and avoid guessing.`;
+    return `Tool access is enabled.${summary}${cwdNote} Use tools to verify facts and avoid guessing.\n\n${TOOL_SELECTION_GUIDE}`;
   }
   if (tooling.status === 'blocked') {
     const reason = tooling.reason ? `: ${tooling.reason}` : '';
@@ -70,6 +91,9 @@ export function buildSystemPrompt(
   options: SystemPromptOptions,
 ): string {
   const roster = roles.join(', ');
+  const delegationLimit = options.maxDelegations
+    ? `Limit delegations to ${options.maxDelegations} per response (excess will be truncated).`
+    : '';
   return [
     `You are the ${role} agent (${ROLE_BRIEFS[role]}).`,
     ROLE_GUIDELINES[role],
@@ -77,11 +101,16 @@ export function buildSystemPrompt(
       ? `You can delegate to roles: ${roster}.`
       : 'Delegation is disabled for this request.',
     options.allowDelegation ? `You may delegate recursively up to depth ${maxDepth}.` : '',
+    options.allowDelegation && delegationLimit ? delegationLimit : '',
     buildToolingLine(options.tooling),
     'Return JSON only. Do not wrap in code fences.',
     'Fields: summary (string), rationale (string, optional), notes (array of strings, optional),',
     'delegations (array of {role, objective, rationale?}), risks (array of strings, optional).',
     'Be SPECIFIC: include file paths, line numbers, function names. Avoid vague statements like "issues found".',
+    'ANTI-HALLUCINATION: Do NOT claim to have modified/fixed code unless you used edit_file.',
+    'Do NOT suggest files, services, or modules that do not exist in the project.',
+    'If tool calls returned errors or no results, acknowledge the failure explicitly.',
+    'After using tools, you MUST synthesize findings into a coherent summary - do not just return tool results.',
     'Prefer small, high-leverage delegations. Keep outputs terse but concrete.',
   ]
     .filter((line) => line.trim().length > 0)
